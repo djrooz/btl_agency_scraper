@@ -1,0 +1,189 @@
+name: BTL Agency Data Collection
+
+on:
+  # Запуск по расписанию (каждый понедельник в 02:00 UTC)
+  schedule:
+    - cron: '0 2 * * 1'
+  
+  # Ручной запуск
+  workflow_dispatch:
+
+  # Запуск при push в main
+  push:
+    branches: [ main ]
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Cache Python packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Create directories
+      run: |
+        mkdir -p data/raw data/interim logs
+    
+    - name: Generate demo data
+      run: |
+        python demo_data.py
+    
+    - name: Run data collection (demo)
+      run: |
+        python demo_main.py
+      env:
+        PYTHONPATH: ${{ github.workspace }}
+    
+    - name: Validate results
+      run: |
+        # Проверяем, что файлы созданы
+        test -f data/companies.csv
+        test -f data/companies_sample.xlsx
+        
+        # Проверяем количество записей
+        lines=$(wc -l < data/companies.csv)
+        if [ $lines -lt 10 ]; then
+          echo "Error: Too few companies in result ($lines)"
+          exit 1
+        fi
+        
+        echo "✅ Validation passed: $lines companies collected"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: btl-agencies-data
+        path: |
+          data/companies.csv
+          data/companies_sample.xlsx
+          data/interim/
+          logs/
+    
+    - name: Create release on main
+      if: github.ref == 'refs/heads/main'
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: data-${{ github.run_number }}
+        release_name: BTL Agencies Data Release ${{ github.run_number }}
+        body: |
+          Automated data collection run #${{ github.run_number }}
+          
+          📊 **Statistics:**
+          - Collection date: ${{ github.event.head_commit.timestamp }}
+          - Workflow: ${{ github.workflow }}
+          
+          📁 **Files:**
+          - `companies.csv` - Main results
+          - `companies_sample.xlsx` - Sample data
+          
+          🔗 **Download:** See artifacts below
+        draft: false
+        prerelease: false
+
+  test-data-quality:
+    runs-on: ubuntu-latest
+    needs: collect-data
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install test dependencies
+      run: |
+        pip install pandas pytest
+    
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: btl-agencies-data
+        path: ./artifacts/
+    
+    - name: Run data quality tests
+      run: |
+        python -c "
+        import pandas as pd
+        import sys
+        
+        # Загружаем данные
+        df = pd.read_csv('artifacts/companies.csv')
+        
+        print(f'📊 Total companies: {len(df)}')
+        
+        # Тесты качества данных
+        errors = []
+        
+        # 1. Минимальное количество записей
+        if len(df) < 10:
+            errors.append(f'Too few records: {len(df)}')
+        
+        # 2. Обязательные поля
+        required_fields = ['inn', 'name', 'revenue', 'segment_tag', 'source']
+        for field in required_fields:
+            if field not in df.columns:
+                errors.append(f'Missing required field: {field}')
+            elif df[field].isna().sum() > len(df) * 0.1:  # Более 10% пустых
+                errors.append(f'Too many empty values in {field}: {df[field].isna().sum()}/{len(df)}')
+        
+        # 3. Валидация ИНН
+        if 'inn' in df.columns:
+            invalid_inn = df[~df['inn'].astype(str).str.match(r'^\d{10,12}$')]
+            if len(invalid_inn) > 0:
+                errors.append(f'Invalid INN format: {len(invalid_inn)} records')
+        
+        # 4. Валидация выручки
+        if 'revenue' in df.columns:
+            min_revenue = 200_000_000
+            low_revenue = df[df['revenue'] < min_revenue]
+            if len(low_revenue) > 0:
+                print(f'⚠️  Companies with revenue < {min_revenue:,}: {len(low_revenue)}')
+        
+        # 5. Валидные сегменты
+        valid_segments = ['BTL', 'SOUVENIR', 'FULL_CYCLE', 'COMM_GROUP', 'EVENT', 'PROMO']
+        if 'segment_tag' in df.columns:
+            invalid_segments = df[~df['segment_tag'].isin(valid_segments)]
+            if len(invalid_segments) > 0:
+                errors.append(f'Invalid segments: {len(invalid_segments)} records')
+        
+        # Выводим статистику
+        print('\\n📈 Statistics by segment:')
+        if 'segment_tag' in df.columns:
+            print(df['segment_tag'].value_counts().to_string())
+        
+        print('\\n📈 Statistics by source:')
+        if 'source' in df.columns:
+            print(df['source'].value_counts().to_string())
+        
+        # Проверяем ошибки
+        if errors:
+            print('\\n❌ Data quality errors:')
+            for error in errors:
+                print(f'  - {error}')
+            sys.exit(1)
+        else:
+            print('\\n✅ All data quality tests passed!')
+        "
